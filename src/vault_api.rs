@@ -65,6 +65,9 @@ pub(crate) enum VaultOp {
     HandleQr,
     AbortQr,
 
+    MenuTetris,
+    TetrisTick,
+
     // monkey patch for last-minute custom image feature - discriminant is hard-coded into dc34-console
     ImageLoad = 1024,
     // monkey patch to force jig mode, for re-tested units in the factory

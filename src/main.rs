@@ -22,11 +22,12 @@ mod generator;
 mod idlemenu;
 mod tests;
 mod vendor_commands;
+mod tetris;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io::Read;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dc34_api::*;
 use locales::t;
@@ -70,6 +71,7 @@ pub enum VaultMode {
     Totp,
     Password,
     TokenHelp,
+    Tetris,
 }
 
 impl VaultMode {
@@ -90,6 +92,7 @@ impl VaultMode {
             VaultMode::ShowKey { quantum: _ } => true,
             VaultMode::TokenTour => false,
             VaultMode::Tour => false,
+            VaultMode::Tetris => false,  // we drive redraws ourselves via TetrisTick
         }
     }
 }
@@ -229,6 +232,31 @@ fn main() -> ! {
     xous::send_message(pump_conn, xous::Message::new_scalar(0, 0, 0, 0, 0))
         .expect("couldn't start the pumper");
 
+    // Gravity speed and clear-animation timing are tuned inside tetris.rs itself, keyed off
+    // tick counts rather than wall-clock time; this thread's job is just to supply a fast,
+    // steady heartbeat while a game is in progress, fast enough for a smooth clear-flash
+    // animation. It fires far more often than the board actually needs to move, so
+    // gravity_tick() reports back whether anything visibly changed and we only redraw then -
+    // otherwise this would be flushing the display ~100x/sec for nothing.
+    const TETRIS_TICK_MS: usize = 10;
+    {
+        let conn = conn.clone();
+        let mode = mode.clone();
+        std::thread::spawn(move || {
+            let tt = ticktimer_server::Ticktimer::new().unwrap();
+            loop {
+                tt.sleep_ms(TETRIS_TICK_MS).ok();
+                if *mode.lock().unwrap() == VaultMode::Tetris {
+                    xous::send_message(
+                        conn,
+                        xous::Message::new_scalar(VaultOp::TetrisTick.to_usize().unwrap(), 0, 0, 0, 0),
+                    )
+                    .ok();
+                }
+            }
+        });
+    }
+
     // respond to keyboard events - register with the `Gfx` subsystem, so we're getting keypresses
     // filtered by the modals interface
     gfx.register_listener(SERVER_NAME_VAULT2, VaultOp::KeyPress.to_u32().unwrap() as usize);
@@ -302,6 +330,16 @@ fn main() -> ! {
     let mut mutation_param: u8 = 0;
     let mut k_last = '\u{0000}';
     let mut skip_one_key = false;
+    let mut tetris_game: Option<tetris::TetrisGame> = None;
+    // move_left/move_right/hard_drop are fine to fire on every raw KeyPress they receive - a
+    // few extra moves from a bouncy/repeating button just nudges the piece an extra cell,
+    // which is barely noticeable. rotate() isn't: two rotate calls from a single physical
+    // press cancel back out to (or past) the original orientation, which is exactly the
+    // "works once, then stops, randomly works again" symptom - it depends on how many raw
+    // events that one press happened to generate. Debouncing just this button fixes it
+    // without touching the (correct) rotation math itself.
+    let mut last_rotate = Instant::now() - Duration::from_secs(1);
+    const ROTATE_DEBOUNCE_MS: u64 = 150;
     loop {
         global_config.lock().unwrap().update_power_state(mode.lock().unwrap().clone());
         let msg = xous::receive_message(sid).unwrap();
@@ -324,7 +362,19 @@ fn main() -> ! {
                     log::info!("{}", mutation_param);
                 }*/
                 if !menu_active {
-                    vault_ui.redraw();
+                    // This handler fires on every periodic UI heartbeat (pumper) regardless of
+                    // what mode we're in. Previously it unconditionally called vault_ui.redraw(),
+                    // which painted the normal item-list UI *over* the Tetris board every time this
+                    // message arrived, only for the next TetrisTick/keypress to paint the board back
+                    // on top a moment later - the "flashes back to the list" symptom. Route this the
+                    // same way the other UI entry points (KeyPress, MenuDone) already do.
+                    if *mode.lock().unwrap() == VaultMode::Tetris {
+                        if let Some(game) = tetris_game.as_ref() {
+                            game.draw(&gfx);
+                        }
+                    } else {
+                        vault_ui.redraw();
+                    }
                 }
             }
             Some(VaultOp::ReloadDbAndFullRedraw) => {
@@ -334,14 +384,24 @@ fn main() -> ! {
                 )
                 .ok();
                 vault_ui.refresh_draw_list();
-                vault_ui.redraw();
+                // Same class of bug as VaultOp::Redraw above: don't let a DB/basis-change-triggered
+                // redraw stomp the Tetris board.
+                if *mode.lock().unwrap() != VaultMode::Tetris {
+                    vault_ui.redraw();
+                }
             }
             Some(VaultOp::MenuDone) => {
                 menu_active = false;
-                // update the TOTP codes, in case there were changes
-                vault_ui.refresh_draw_list();
-                animate.store(mode.lock().unwrap().should_animate(), Ordering::SeqCst);
-                vault_ui.redraw();
+                if *mode.lock().unwrap() == VaultMode::Tetris {
+                    if let Some(game) = tetris_game.as_ref() {
+                        game.draw(&gfx);
+                    }
+                } else {
+                    // update the TOTP codes, in case there were changes
+                    vault_ui.refresh_draw_list();
+                    animate.store(mode.lock().unwrap().should_animate(), Ordering::SeqCst);
+                    vault_ui.redraw();
+                }
             }
             Some(VaultOp::SkipKey) => {
                 skip_one_key = true;
@@ -374,6 +434,7 @@ fn main() -> ! {
                     vault_ui.jig_ready();
                     jig_ready_seen = true;
                 }
+
                 if menu_active {
                     if matches!(mode_now, VaultMode::Tour) {
                         tour_menu_mgr.key_press(k);
@@ -381,10 +442,56 @@ fn main() -> ! {
                         gene_menu_mgr.key_press(k);
                     } else if matches!(mode_now, VaultMode::Idle)
                         || matches!(mode_now, VaultMode::IdleDevMode)
+                        || matches!(mode_now, VaultMode::Tetris)
                     {
+                        // Tetris reuses idle_menu_mgr as its pause menu (see the '∴' arm below),
+                        // so input needs to route there too while mode is still Tetris - otherwise
+                        // it falls through to menu_mgr, a manager that was never drawn, and the
+                        // display gets corrupted/blanked on the next keypress.
                         idle_menu_mgr.key_press(k);
                     } else {
                         menu_mgr.key_press(k);
+                    }
+                } else if mode_now == VaultMode::Tetris {
+                    if let Some(game) = tetris_game.as_mut() {
+                        match k {
+                            '←' => {
+                                game.move_left();
+                                game.draw(&gfx);
+                            }
+                            '→' => {
+                                game.move_right();
+                                game.draw(&gfx);
+                            }
+                            '↓' => {
+                                game.hard_drop();
+                                game.draw(&gfx);
+                            }
+                            // Middle front button sends '🔥' on this hardware (not '∴' - that's
+                            // a separate control used for pause/menu below).
+                            '🔥' => {
+                                let now = Instant::now();
+                                if now.duration_since(last_rotate) >= Duration::from_millis(ROTATE_DEBOUNCE_MS) {
+                                    last_rotate = now;
+                                    game.rotate();
+                                    game.draw(&gfx);
+                                }
+                            }
+                            '∴' => {
+                                // pause: fall through to idle menu like the normal flow does.
+                                // Deliberately NOT calling game.draw() here - it was previously
+                                // called unconditionally after this match, which repainted the
+                                // Tetris board over idle_menu_mgr.redraw() on the very same
+                                // keypress. That's why the menu only flashed for a frame: the
+                                // menu draw call happened, then got immediately clobbered before
+                                // the frame was ever seen, even though menu_active was already
+                                // true and subsequent presses were (invisibly) going to the menu.
+                                animate.store(false, Ordering::SeqCst);
+                                idle_menu_mgr.redraw();
+                                menu_active = true;
+                            }
+                            _ => {}
+                        }
                     }
                 } else {
                     // let the UI get first whack at filtering keys - the '∴' key may be intercepted
@@ -423,7 +530,7 @@ fn main() -> ! {
                                     0,
                                 ),
                             )
-                            .ok();
+                                .ok();
                             // wait a moment for the last frame to clear before redrawing the UI
                             tt.sleep_ms(100).ok();
                             animate.store(prior_mode, Ordering::SeqCst);
@@ -441,7 +548,7 @@ fn main() -> ! {
                                         0,
                                     ),
                                 )
-                                .ok();
+                                    .ok();
                                 vault_ui.refresh_draw_list();
                             }
                             vault_ui.redraw();
@@ -468,8 +575,8 @@ fn main() -> ! {
                     let buf = Buffer::into_buf(entry).expect("IPC error");
                     buf.lend(actions_conn, ActionOp::MenuEditStage2.to_u32().unwrap())
                         .expect("messaging error");
-                } else {
-                    modals.show_notification(t!("vault.error.nothing_selected", locales::LANG), None).ok();
+                    } else {
+                        modals.show_notification(t!("vault.error.nothing_selected", locales::LANG), None).ok();
                 }
                 animate.store(mode.lock().unwrap().should_animate(), Ordering::SeqCst);
             }
@@ -493,14 +600,14 @@ fn main() -> ! {
                     let buf = Buffer::into_buf(entry).expect("IPC error");
                     buf.lend(actions_conn, ActionOp::MenuDeleteStage2.to_u32().unwrap())
                         .expect("messaging error");
-                } else {
-                    modals.show_notification(t!("vault.error.nothing_selected", locales::LANG), None).ok();
+                    } else {
+                        modals.show_notification(t!("vault.error.nothing_selected", locales::LANG), None).ok();
                 }
                 xous::send_message(
                     actions_conn,
                     xous::Message::new_blocking_scalar(ActionOp::ReloadDb.to_usize().unwrap(), 0, 0, 0, 0),
                 )
-                .ok();
+                    .ok();
                 animate.store(mode.lock().unwrap().should_animate(), Ordering::SeqCst);
                 vault_ui.refresh_draw_list();
                 vault_ui.redraw();
@@ -560,7 +667,7 @@ fn main() -> ! {
                     actions_conn,
                     xous::Message::new_blocking_scalar(ActionOp::ReloadDb.to_usize().unwrap(), 0, 0, 0, 0),
                 )
-                .ok();
+                    .ok();
                 animate.store(mode.lock().unwrap().should_animate(), Ordering::SeqCst);
                 vault_ui.refresh_draw_list();
                 vault_ui.redraw();
@@ -590,8 +697,8 @@ fn main() -> ! {
                         0,
                     ),
                 )
-                .ok();
-            }
+                    .ok();
+                }
             Some(VaultOp::AbortQr) => {
                 if global_config.lock().unwrap().is_badge_attached() {
                     *mode.lock().unwrap() = VaultMode::Idle;
@@ -616,7 +723,7 @@ fn main() -> ! {
 
                 match mode_now {
                     VaultMode::GeneScan
-                    | VaultMode::ResponseGene { quantum: _ }
+                        | VaultMode::ResponseGene { quantum: _ }
                     | VaultMode::ShowKey { quantum: _ } => {
                         match base45::decode(&s.s.as_bytes()) {
                             Ok(data) => {
@@ -650,7 +757,7 @@ fn main() -> ! {
                                         encoded.as_bytes(),
                                         qrcode::EcLevel::M,
                                     )
-                                    .expect("couldn't build QR code");
+                                        .expect("couldn't build QR code");
                                     log::info!(
                                         "Gene encoded {} bytes to Qrcode version {:?}",
                                         encoded.as_bytes().len(),
@@ -753,8 +860,8 @@ fn main() -> ! {
                                                     let mut msg = TextView::new(
                                                         ux_api::service::api::Gid::dummy(),
                                                         TextBounds::CenteredTop(Rectangle::new(
-                                                            Point::new(0, 0),
-                                                            Point::new(127, 16),
+                                                                Point::new(0, 0),
+                                                                Point::new(127, 16),
                                                         )),
                                                     );
                                                     write!(msg, "{}", text).ok();
@@ -783,14 +890,14 @@ fn main() -> ! {
                                                             0,
                                                         ),
                                                     )
-                                                    .ok();
-                                                });
+                                                        .ok();
+                                                    });
                                                 /*
-                                                animate.store(false, Ordering::SeqCst);
-                                                menu_active = true;
+                                                   animate.store(false, Ordering::SeqCst);
+                                                   menu_active = true;
 
-                                                gene_menu_mgr.redraw();
-                                                */
+                                                   gene_menu_mgr.redraw();
+                                                   */
                                             } else {
                                                 log::error!("Failed to deserialize gene");
                                                 *mode.lock().unwrap() = VaultMode::Idle;
@@ -801,7 +908,7 @@ fn main() -> ! {
                                                 modals
                                                     .show_notification("Gene failed to deserialize", None)
                                                     .ok();
-                                            }
+                                                }
                                         }
                                         Err(e) => {
                                             log::error!("Failed to decrypt gene: {:?}", e);
@@ -897,7 +1004,7 @@ fn main() -> ! {
                             0,
                         ),
                     )
-                    .ok();
+                        .ok();
                     vault_ui.refresh_draw_list();
                 }
                 log::info!("tour_later redraw");
@@ -917,7 +1024,7 @@ fn main() -> ! {
                             0,
                         ),
                     )
-                    .ok();
+                        .ok();
                     vault_ui.refresh_draw_list();
                 }
                 vault_ui.redraw();
@@ -935,11 +1042,12 @@ fn main() -> ! {
             }
             Some(VaultOp::TokenMode) => {
                 *mode.lock().unwrap() = VaultMode::Password;
+                tetris_game = None;
                 xous::send_message(
                     actions_conn,
                     xous::Message::new_blocking_scalar(ActionOp::ReloadDb.to_usize().unwrap(), 0, 0, 0, 0),
                 )
-                .ok();
+                    .ok();
                 vault_ui.refresh_draw_list();
                 vault_ui.redraw();
             }
@@ -955,6 +1063,7 @@ fn main() -> ! {
             }
             Some(VaultOp::BadgeMode) => {
                 *mode.lock().unwrap() = VaultMode::Idle;
+                tetris_game = None;
                 vault_ui.redraw();
             }
             Some(VaultOp::About) => {
@@ -977,8 +1086,8 @@ fn main() -> ! {
                         .dynamic_notification_update(
                             None,
                             Some(&format!(
-                                "Power down in {} seconds.\n-----------\nPress any key to power on.",
-                                t
+                                    "Power down in {} seconds.\n-----------\nPress any key to power on.",
+                                    t
                             )),
                         )
                         .ok();
@@ -1015,6 +1124,42 @@ fn main() -> ! {
                 *mode.lock().unwrap() = VaultMode::FactoryTest;
                 vault_ui.reset_factory_test();
                 vault_ui.redraw();
+            },
+            Some(VaultOp::MenuTetris) => {
+                *mode.lock().unwrap() = VaultMode::Tetris;
+                let game = tetris::TetrisGame::new(&gfx);
+                game.draw(&gfx);
+                tetris_game = Some(game);
+            }
+            Some(VaultOp::TetrisTick) => {
+                // Don't advance gravity or repaint the board while the pause menu is up - this
+                // was firing unconditionally every tick regardless of menu_active, silently
+                // continuing the game underneath the menu and then painting over it, which is
+                // why the menu only stayed visible for a few frames before "reverting".
+                if !menu_active {
+                    if let Some(game) = tetris_game.as_mut() {
+                        // Ticks now arrive far faster than the board actually moves (see the
+                        // timer thread above) so gravity_tick() only reports a real change -
+                        // a gravity step, or a clear-flash frame boundary - some of the time.
+                        // Only repaint then, or this would be doing a full-screen flush on
+                        // every 10ms tick regardless of whether anything moved.
+                        if game.gravity_tick() {
+                            game.draw(&gfx);
+                        }
+                        if game.is_over() {
+                            // Previously this just dropped back to VaultMode::Idle + a plain
+                            // vault_ui.redraw(), which is the badge/logo screen. Go to the main
+                            // (idle) menu instead - same thing that happens when '∴' is pressed
+                            // from Idle - so there's somewhere to actually go (restart, badge
+                            // mode, etc.) right after losing instead of landing on a static splash.
+                            tetris_game = None;
+                            *mode.lock().unwrap() = VaultMode::Idle;
+                            animate.store(false, Ordering::SeqCst);
+                            idle_menu_mgr.redraw();
+                            menu_active = true;
+                        }
+                    }
+                }
             }
             _ => {
                 log::error!("Got unknown message: {:?}", msg);
