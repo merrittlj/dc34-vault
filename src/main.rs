@@ -326,10 +326,15 @@ fn main() -> ! {
     let mut k_last = '\u{0000}';
     let mut skip_one_key = false;
     let mut tetris_game: Option<tetris::TetrisGame> = None;
+    // Set by key handlers instead of drawing inline, so a slow full-board redraw never runs
+    // synchronously inside the KeyPress message handler (which would stall whatever's
+    // delivering key events for the duration of the draw). TetrisTick, which already fires
+    // every 10ms, picks this up and does the actual draw - see VaultOp::TetrisTick below.
+    let mut tetris_dirty = false;
     let mut last_rotate = Instant::now() - Duration::from_secs(1);
     const ROTATE_DEBOUNCE_MS: u64 = 50;
     let mut last_drop = Instant::now() - Duration::from_secs(1);
-    const DROP_DEBOUNCE_MS: u64 = 300;
+    const DROP_DEBOUNCE_MS: u64 = 100;
     loop {
         global_config.lock().unwrap().update_power_state(mode.lock().unwrap().clone());
         let msg = xous::receive_message(sid).unwrap();
@@ -436,18 +441,18 @@ fn main() -> ! {
                         match k {
                             '←' => {
                                 game.move_left();
-                                game.draw(&gfx);
+                                tetris_dirty = true;
                             }
                             '→' => {
                                 game.move_right();
-                                game.draw(&gfx);
+                                tetris_dirty = true;
                             }
                             '↓' => {
                                 let now = Instant::now();
                                 if now.duration_since(last_drop) >= Duration::from_millis(DROP_DEBOUNCE_MS) {
                                     last_drop = now;
                                     game.hard_drop();
-                                    game.draw(&gfx);
+                                    tetris_dirty = true;
                                 }
                             }
                             '🔥' => {
@@ -455,7 +460,7 @@ fn main() -> ! {
                                 if now.duration_since(last_rotate) >= Duration::from_millis(ROTATE_DEBOUNCE_MS) {
                                     last_rotate = now;
                                     game.rotate();
-                                    game.draw(&gfx);
+                                    tetris_dirty = true;
                                 }
                             }
                             '∴' => {
@@ -672,7 +677,7 @@ fn main() -> ! {
                     ),
                 )
                 .ok();
-                }
+            }
             Some(VaultOp::AbortQr) => {
                 if global_config.lock().unwrap().is_badge_attached() {
                     *mode.lock().unwrap() = VaultMode::Idle;
@@ -865,13 +870,13 @@ fn main() -> ! {
                                                         ),
                                                     )
                                                     .ok();
-                                                    });
+                                                });
                                                 /*
-                                                   animate.store(false, Ordering::SeqCst);
-                                                   menu_active = true;
+                                                animate.store(false, Ordering::SeqCst);
+                                                menu_active = true;
 
-                                                   gene_menu_mgr.redraw();
-                                                   */
+                                                gene_menu_mgr.redraw();
+                                                */
                                             } else {
                                                 log::error!("Failed to deserialize gene");
                                                 *mode.lock().unwrap() = VaultMode::Idle;
@@ -1021,7 +1026,7 @@ fn main() -> ! {
                     actions_conn,
                     xous::Message::new_blocking_scalar(ActionOp::ReloadDb.to_usize().unwrap(), 0, 0, 0, 0),
                 )
-                    .ok();
+                .ok();
                 vault_ui.refresh_draw_list();
                 vault_ui.redraw();
             }
@@ -1108,8 +1113,10 @@ fn main() -> ! {
             Some(VaultOp::TetrisTick) => {
                 if !menu_active {
                     if let Some(game) = tetris_game.as_mut() {
-                        if game.gravity_tick() {
+                        let gravity_advanced = game.gravity_tick();
+                        if gravity_advanced || tetris_dirty {
                             game.draw(&gfx);
+                            tetris_dirty = false;
                         }
                         if game.is_over() {
                             // return to main list screen

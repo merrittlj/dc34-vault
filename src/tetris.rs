@@ -1,8 +1,6 @@
-// Tetris — all seven standard pieces, 4-way rotation (simplified wall-kick, no full SRS
+// Tetris - all seven standard pieces, 4-way rotation (simplified wall-kick, no full SRS
 // kick table), 7-bag randomization, a score counter, a side-mounted HUD (score + next-piece
 // preview), and a flash animation for row clears.
-// Rendering uses gfx.draw_rounded_rectangle(), matching the pattern in ux.rs's totp_box, and
-// text uses TextView/gfx.draw_textview(), matching the pattern in ux.rs's battery/attach labels.
 
 use core::fmt::Write;
 use std::collections::VecDeque;
@@ -13,34 +11,20 @@ use ux_api::service::api::Gid;
 use ux_api::service::gfx::Gfx;
 
 const BOARD_W: usize = 10;
-// Board height is not fixed - it's picked at construction time from the real screen so we
-// always get a standard-width (10 col) board, as tall as the panel reasonably allows,
-// without ever exceeding it. See `new()`.
+// board height is sized at construction time
 const MIN_BOARD_H: usize = 16;
 const MAX_BOARD_H: usize = 24;
 
-// Fixed column reserved on the right edge of the screen for the score readout and the
-// next-piece preview, subtracted from the usable width before the board is sized. Reserving
-// this up front (rather than trying to steal space from whatever margin the board sizing
-// happens to leave) keeps the HUD available regardless of the panel's aspect ratio.
+// reservation on left side for next piece/score
 const HUD_WIDTH: isize = 34;
 
-// Vertical breathing room reserved above and below the board for draw_board_frame()'s outline
-// (see below). Reserved up front here, the same way HUD_WIDTH is reserved off the width,
-// rather than drawn as an afterthought outset from whatever centering happened to leave over -
-// the row-fitting math below greedily fills all available height, so without this the leftover
-// slack is just a division remainder (often less than FRAME_PAD, sometimes exactly 0).
+// padding for outline
 const FRAME_PAD: isize = 3;
 
-// main.rs's Tetris timer thread now fires a raw tick every 10ms - far faster than the board
-// should actually move - so gravity speed is tuned here instead, as a tick count rather than
-// wall-clock time. GRAVITY_TICKS * 10ms = the delay between gravity steps; tune this to
-// change gravity speed (60 ticks = 600ms, the original speed).
+// main.rs fires tetris ticks at 10ms, one gravity tick should be 600ms, so 10 * 60
 const GRAVITY_TICKS: u32 = 60;
 
-// Clear-flash timing, also in raw ticks: each blink phase (on or off) lasts
-// CLEAR_ANIM_TICKS_PER_FRAME ticks, and the flash runs for CLEAR_ANIM_FRAMES phases before the
-// rows collapse. 8 * 10ms = 80ms/phase, 4 phases = 320ms total - two quick blinks.
+// timing for flash animation on clear
 const CLEAR_ANIM_TICKS_PER_FRAME: u8 = 8;
 const CLEAR_ANIM_FRAMES: u8 = 4;
 
@@ -65,35 +49,27 @@ const ALL_PIECES: [Piece; 7] =
 struct ClearAnim {
     rows: Vec<usize>,
     frame: u8,
-    // Raw ticks elapsed within the current frame/phase - see CLEAR_ANIM_TICKS_PER_FRAME.
+    // waw ticks elapsed within the current frame/phase
     tick: u8,
 }
 
 pub struct TetrisGame {
-    // Vec instead of a fixed-size array because board_h now varies per-instance depending on
-    // the panel's resolution.
     board: Vec<[bool; BOARD_W]>,
     board_h: usize,
     piece: Piece,
-    // Rotation state 0..=3 (spawn, 90° CW, 180°, 270° CW), replacing the old two-state
-    // `rotated: bool` now that every piece supports full 4-way rotation.
+    // rotation state 0..=3 (spawn, 90° CW, 180°, 270° CW)
     rotation: u8,
     px: i32,
     py: i32,
     // 7-bag queue: pieces are drawn from the front, and a fresh shuffled set of all seven is
-    // appended whenever fewer than 2 remain (current + next-preview always need to be
-    // resolvable). This guarantees no piece repeats more than once every 7 spawns while still
-    // being effectively random, which is much less streaky than pure per-spawn randomization.
+    // appended whenever fewer than 2 remain 
     queue: VecDeque<Piece>,
     next_piece: Piece,
     score: u32,
     clearing: Option<ClearAnim>,
-    // Raw ticks elapsed since the last gravity step - see GRAVITY_TICKS.
+    // raw ticks elapsed since the last gravity step
     gravity_accum: u32,
     game_over: bool,
-    // Derived from the real panel size at construction time (see `new`) instead of hardcoded
-    // placeholders, so the bottom row of the board is guaranteed to land on-screen no matter
-    // what the actual resolution turns out to be.
     cell_px: isize,
     origin_x: isize,
     origin_y: isize,
@@ -102,27 +78,19 @@ pub struct TetrisGame {
 impl TetrisGame {
     pub fn new(gfx: &Gfx) -> Self {
         let screen = gfx.screen_size().unwrap();
-        // Width available to the board once the HUD column is set aside on the right.
+        // post-hud usable width
         let usable_w = (screen.x - HUD_WIDTH).max(BOARD_W as isize);
-        // Height available to the board once FRAME_PAD is set aside top and bottom for
-        // draw_board_frame()'s outline - mirrors usable_w's reservation above.
+        // post-padding usable height
         let usable_h = (screen.y - 2 * FRAME_PAD).max(MIN_BOARD_H as isize);
 
-        // Width is always exactly BOARD_W (10) cells - size cells off the (HUD-reduced) width
-        // first.
         let cell_px_by_width = (usable_w / BOARD_W as isize).max(1);
         let rows_that_fit = (usable_h / cell_px_by_width).max(0) as usize;
 
         let (cell_px, board_h) = if rows_that_fit >= MIN_BOARD_H {
-            // Normal case: width-driven cell size gives us at least the minimum playable
-            // height. Use as many rows as fit, capped at MAX_BOARD_H.
+            // normally width-driven cell size
             (cell_px_by_width, rows_that_fit.min(MAX_BOARD_H))
         } else {
-            // Screen is unusually short relative to its (HUD-reduced) width - width-driven
-            // cells would leave less than MIN_BOARD_H rows visible. Fall back to sizing cells
-            // off the height instead, guaranteeing the minimum board height. Also cap by the
-            // width-driven size, so a tall/narrow panel can't size the board wider than the
-            // room actually left after reserving the HUD column.
+            // height driven cell size given unusually short dimensions
             let cell_px_by_height = (usable_h / MIN_BOARD_H as isize).max(1);
             (cell_px_by_height.min(cell_px_by_width), MIN_BOARD_H)
         };
@@ -157,9 +125,6 @@ impl TetrisGame {
     fn cell_rect(&self, col: i32, row: i32, filled: bool) -> RoundedRectangle {
         let x0 = self.origin_x + col as isize * self.cell_px;
         let y0 = self.origin_y + row as isize * self.cell_px;
-        // Normal cells are just an outline (dark border, light/empty fill) - filled is used
-        // only for the clear-flash "on" frames, giving a solid highlight pop against the
-        // otherwise outlined board.
         let fill = if filled { PixelColor::Dark } else { PixelColor::Light };
         RoundedRectangle {
             border: Rectangle {
@@ -175,13 +140,10 @@ impl TetrisGame {
         self.game_over
     }
 
-    // Standard tetromino rotation states, each expressed as 4 (col, row) offsets within a
-    // bounding box (2x2 for O, 4x4 for I, 3x3 for the rest). This is a v0 "simple" rotation -
-    // rotating just re-checks the new orientation with a small set of horizontal nudges (see
-    // `rotate`) rather than a full SRS wall-kick table.
+    // standard tetromino rotation states, each expressed as 4 (col, row) offsets within a
+    // bounding box (2x2 for O, 4x4 for I, 3x3 for the rest).
     fn cells_for(piece: Piece, rotation: u8) -> [(i32, i32); 4] {
         match piece {
-            // Rotation-invariant.
             Piece::O => [(0, 0), (1, 0), (0, 1), (1, 1)],
             Piece::I => match rotation {
                 0 => [(0, 1), (1, 1), (2, 1), (3, 1)],
@@ -244,9 +206,7 @@ impl TetrisGame {
         self.collides_shape(px, py, self.cells())
     }
 
-    /// Rotate 90° clockwise in place, nudging left/right (a minimal wall-kick) if the naive
-    /// rotation would clip a wall. No-ops if nothing works (e.g. boxed in), for the O piece
-    /// (rotation-invariant), or while a row-clear flash is playing.
+    // attempt simple wall-kick
     pub fn rotate(&mut self) {
         if self.game_over || self.clearing.is_some() || self.piece == Piece::O {
             return;
@@ -263,11 +223,7 @@ impl TetrisGame {
         // no valid position found - leave orientation unchanged
     }
 
-    /// Locks the current piece into the board. If that completes any rows, they aren't removed
-    /// immediately - instead `clearing` is set so `draw()` can flash them and `gravity_tick()`
-    /// can advance the flash a frame at a time; the actual collapse + next spawn happens in
-    /// `finish_clear()` once the flash finishes. If no rows completed, the next piece spawns
-    /// right away as before.
+    // lock currenct piece, check for clears
     fn lock(&mut self) {
         for (dx, dy) in self.cells() {
             let x = self.px + dx;
@@ -286,8 +242,7 @@ impl TetrisGame {
         }
     }
 
-    // Simple, level-less line-clear scoring (single/double/triple/tetris), matching the
-    // classic guideline base values.
+    // level-less line-clear scoring (single/double/triple/tetris)
     fn score_for(lines_cleared: u32) -> u32 {
         match lines_cleared {
             1 => 100,
@@ -298,9 +253,7 @@ impl TetrisGame {
         }
     }
 
-    /// Collapses whatever rows were flagged by `lock()`, rebuilding the board bottom-up from
-    /// everything that *wasn't* one of them (same "keep the rows that survive" approach the
-    /// original single-pass clear used), then spawns the next piece.
+    // collapses whatever rows were flagged by `lock()`, rebuilding the board bottom-up
     fn finish_clear(&mut self) {
         if let Some(anim) = self.clearing.take() {
             let mut new_board = vec![[false; BOARD_W]; self.board_h];
@@ -316,19 +269,11 @@ impl TetrisGame {
         self.spawn();
     }
 
-    // Tops up the 7-bag queue whenever fewer than 2 pieces remain in it (current spawn needs
-    // one, and the next-piece preview needs to be able to peek one more). Each top-up appends
-    // one full shuffled set of all seven pieces, so within any run of 7 consecutive spawns every
-    // piece appears exactly once - the standard "bag" randomizer, which avoids the long
-    // same-piece droughts/streaks that pure per-spawn randomness can produce.
+    // tops up the 7-bag queue whenever fewer than 2 pieces remain in it
     fn ensure_queue(queue: &mut VecDeque<Piece>) {
         while queue.len() < 2 {
             let mut bag = ALL_PIECES;
-            // Fisher-Yates shuffle. Uses RngCore::next_u32() directly (the same primitive
-            // already relied on elsewhere in this codebase - see config.rs's nonce
-            // generation via rand::thread_rng().fill_bytes()) rather than the higher-level
-            // Rng::gen_range, so this doesn't depend on any rand API surface beyond what's
-            // already proven to build here.
+            // Fisher-Yates shuffle, uses RngCore::next_u32() directly
             use rand::RngCore;
             let mut rng = rand::thread_rng();
             for i in (1..bag.len()).rev() {
@@ -347,8 +292,6 @@ impl TetrisGame {
         self.rotation = 0;
         self.px = BOARD_W as i32 / 2 - 1;
         self.py = 0;
-        // Each new piece starts its own fresh gravity countdown, rather than inheriting
-        // whatever partial accumulation was left over from whatever just locked.
         self.gravity_accum = 0;
         if self.collides(self.px, self.py) {
             self.game_over = true;
@@ -367,9 +310,6 @@ impl TetrisGame {
         }
     }
 
-    /// Hard drop: slam the piece straight down to wherever it lands and lock it immediately.
-    /// Bound to the down button instead of a single-step soft drop - sidesteps the upstream
-    /// key-repeat delay entirely, since a single press now does the whole drop.
     pub fn hard_drop(&mut self) {
         if self.game_over || self.clearing.is_some() {
             return;
@@ -380,10 +320,8 @@ impl TetrisGame {
         self.lock();
     }
 
-    /// Called on every raw tick from main.rs's fast (10ms) timer thread. Most calls are no-ops
-    /// visually - this just counts ticks until it's actually time to either step gravity or
-    /// advance the clear-flash by one phase - so it returns whether anything visible changed,
-    /// letting the caller skip redrawing (and flushing the display) on the ticks that didn't.
+    // called on every raw tick from main.rs's fast (10ms) timer thread, most calls are no-ops
+    // visually - this just counts ticks until it's time to either step gravity or flash
     pub fn gravity_tick(&mut self) -> bool {
         if self.game_over {
             return false;
@@ -426,8 +364,7 @@ impl TetrisGame {
             let is_clearing_row = self.clearing.as_ref().map_or(false, |a| a.rows.contains(&row));
             for col in 0..BOARD_W {
                 if is_clearing_row {
-                    // Flash: solid highlight on "on" frames, plain outline on "off" frames -
-                    // the whole row blinks a couple of times before it collapses.
+                    // flash: solid highlight on "on" frames, plain outline on "off" frames
                     gfx.draw_rounded_rectangle(self.cell_rect(col as i32, row as i32, flash_on)).ok();
                 } else if self.board[row][col] {
                     gfx.draw_rounded_rectangle(self.cell_rect(col as i32, row as i32, false)).ok();
@@ -450,20 +387,10 @@ impl TetrisGame {
         gfx.flush().ok();
     }
 
-    // Outline around the whole play field. Each cell already draws its own border, but an
-    // empty edge column/row has nothing but background on its outer side (only occupied/
-    // clearing cells get drawn - see the loop below), so the actual limits of the board
-    // weren't visible until something was stacked against them. This draws once, before the
-    // per-cell loop, so the per-cell fills painted afterward sit cleanly on top of its
-    // interior and only the traced perimeter (plus the padding ring around it) survives.
     fn draw_board_frame(&self, gfx: &Gfx) {
         let screen = gfx.screen_size().unwrap();
         let board_w_px = self.cell_px * BOARD_W as isize;
         let board_h_px = self.cell_px * self.board_h as isize;
-        // A few pixels of breathing room between the cells and the outline, rather than
-        // drawing it flush against them. FRAME_PAD is now reserved up front in `new()` (see
-        // usable_h), so this should always have room; the clamps are just a defensive
-        // fallback for edge-case panel sizes.
         let hud_x0 = screen.x - HUD_WIDTH;
         let tl_x = (self.origin_x - FRAME_PAD).max(0);
         let tl_y = (self.origin_y - FRAME_PAD).max(0);
@@ -480,21 +407,12 @@ impl TetrisGame {
         gfx.draw_rounded_rectangle(frame).ok();
     }
 
-    // Score readout and next-piece preview, stacked in the HUD_WIDTH column reserved on the
-    // right edge of the screen in `new()`.
+    // next piece and score display
     fn draw_hud(&self, gfx: &Gfx) {
         let screen = gfx.screen_size().unwrap();
         let hud_x0 = screen.x - HUD_WIDTH;
 
-        // Text was clipped ("Score" losing its final "e") because its box ran flush from
-        // hud_x0 to screen.x - the literal right edge of the physical display - so centered
-        // text with zero margin to spare got its rightmost pixels cut by the screen edge
-        // itself rather than by anything we control. `new()` centers the board inside
-        // (screen.x - HUD_WIDTH), which almost always leaves a few leftover px between the
-        // board's right edge and hud_x0 (from the integer-division centering). Anchoring text
-        // to that real right edge instead of hud_x0 recovers that slack as extra width - it's
-        // never negative (board_right_edge <= hud_x0 by construction) and never encroaches on
-        // the board, so the reserved HUD_WIDTH column itself is untouched.
+        // helps prevent text clipping
         let board_right_edge = self.origin_x + self.cell_px * BOARD_W as isize;
         let text_x0 = board_right_edge.min(hud_x0);
 
@@ -528,13 +446,6 @@ impl TetrisGame {
         write!(next_label_tv, "Next").ok();
         gfx.draw_textview(&mut next_label_tv).ok();
 
-        // Small outlined squares in the same style as the board itself, just drawn at a
-        // fixed, smaller cell size so the preview fits the HUD column regardless of how big
-        // the board's own cells ended up being for this panel. Bumped up from 3 -> 5px/cell
-        // (still centered within the same HUD_WIDTH column, so the column itself doesn't
-        // change size) - HUD_WIDTH is 34px and a 4-cell-wide piece only needs 20px at this
-        // size, so there's room to go up to ~8px/cell if you want it bigger still; the
-        // limiting factor at that point is vertical space below preview_origin_y, not width.
         let preview_cell_px: isize = 5;
         let preview_origin_x = hud_x0 + (HUD_WIDTH - preview_cell_px * 4) / 2;
         let preview_origin_y: isize = 54;
