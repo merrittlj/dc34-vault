@@ -25,6 +25,13 @@ const MAX_BOARD_H: usize = 24;
 // happens to leave) keeps the HUD available regardless of the panel's aspect ratio.
 const HUD_WIDTH: isize = 34;
 
+// Vertical breathing room reserved above and below the board for draw_board_frame()'s outline
+// (see below). Reserved up front here, the same way HUD_WIDTH is reserved off the width,
+// rather than drawn as an afterthought outset from whatever centering happened to leave over -
+// the row-fitting math below greedily fills all available height, so without this the leftover
+// slack is just a division remainder (often less than FRAME_PAD, sometimes exactly 0).
+const FRAME_PAD: isize = 3;
+
 // main.rs's Tetris timer thread now fires a raw tick every 10ms - far faster than the board
 // should actually move - so gravity speed is tuned here instead, as a tick count rather than
 // wall-clock time. GRAVITY_TICKS * 10ms = the delay between gravity steps; tune this to
@@ -97,11 +104,14 @@ impl TetrisGame {
         let screen = gfx.screen_size().unwrap();
         // Width available to the board once the HUD column is set aside on the right.
         let usable_w = (screen.x - HUD_WIDTH).max(BOARD_W as isize);
+        // Height available to the board once FRAME_PAD is set aside top and bottom for
+        // draw_board_frame()'s outline - mirrors usable_w's reservation above.
+        let usable_h = (screen.y - 2 * FRAME_PAD).max(MIN_BOARD_H as isize);
 
         // Width is always exactly BOARD_W (10) cells - size cells off the (HUD-reduced) width
         // first.
         let cell_px_by_width = (usable_w / BOARD_W as isize).max(1);
-        let rows_that_fit = (screen.y / cell_px_by_width).max(0) as usize;
+        let rows_that_fit = (usable_h / cell_px_by_width).max(0) as usize;
 
         let (cell_px, board_h) = if rows_that_fit >= MIN_BOARD_H {
             // Normal case: width-driven cell size gives us at least the minimum playable
@@ -113,7 +123,7 @@ impl TetrisGame {
             // off the height instead, guaranteeing the minimum board height. Also cap by the
             // width-driven size, so a tall/narrow panel can't size the board wider than the
             // room actually left after reserving the HUD column.
-            let cell_px_by_height = (screen.y / MIN_BOARD_H as isize).max(1);
+            let cell_px_by_height = (usable_h / MIN_BOARD_H as isize).max(1);
             (cell_px_by_height.min(cell_px_by_width), MIN_BOARD_H)
         };
 
@@ -409,6 +419,8 @@ impl TetrisGame {
     pub fn draw(&self, gfx: &Gfx) {
         gfx.clear().ok();
 
+        self.draw_board_frame(gfx);
+
         let flash_on = self.clearing.as_ref().map_or(false, |a| a.frame % 2 == 0);
         for row in 0..self.board_h {
             let is_clearing_row = self.clearing.as_ref().map_or(false, |a| a.rows.contains(&row));
@@ -436,6 +448,36 @@ impl TetrisGame {
         self.draw_hud(gfx);
 
         gfx.flush().ok();
+    }
+
+    // Outline around the whole play field. Each cell already draws its own border, but an
+    // empty edge column/row has nothing but background on its outer side (only occupied/
+    // clearing cells get drawn - see the loop below), so the actual limits of the board
+    // weren't visible until something was stacked against them. This draws once, before the
+    // per-cell loop, so the per-cell fills painted afterward sit cleanly on top of its
+    // interior and only the traced perimeter (plus the padding ring around it) survives.
+    fn draw_board_frame(&self, gfx: &Gfx) {
+        let screen = gfx.screen_size().unwrap();
+        let board_w_px = self.cell_px * BOARD_W as isize;
+        let board_h_px = self.cell_px * self.board_h as isize;
+        // A few pixels of breathing room between the cells and the outline, rather than
+        // drawing it flush against them. FRAME_PAD is now reserved up front in `new()` (see
+        // usable_h), so this should always have room; the clamps are just a defensive
+        // fallback for edge-case panel sizes.
+        let hud_x0 = screen.x - HUD_WIDTH;
+        let tl_x = (self.origin_x - FRAME_PAD).max(0);
+        let tl_y = (self.origin_y - FRAME_PAD).max(0);
+        let br_x = (self.origin_x + board_w_px - 1 + FRAME_PAD).min(hud_x0 - 1);
+        let br_y = (self.origin_y + board_h_px - 1 + FRAME_PAD).min(screen.y - 1);
+        let frame = RoundedRectangle {
+            border: Rectangle {
+                tl: Point::new(tl_x, tl_y),
+                br: Point::new(br_x, br_y),
+                style: DrawStyle::new(PixelColor::Dark, PixelColor::Light, 1),
+            },
+            radius: 1,
+        };
+        gfx.draw_rounded_rectangle(frame).ok();
     }
 
     // Score readout and next-piece preview, stacked in the HUD_WIDTH column reserved on the

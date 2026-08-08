@@ -35,11 +35,6 @@ pub fn create_submenu(vault_conn: xous::CID, actions_conn: xous::CID, menu_mgr: 
         action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
         close_on_select: true,
     });
-    // This menu doubles as the Tetris pause menu (opened via '∴' while playing). Previously the
-    // only items here were Help/About/Token Mode/Tetris(restart)/Close Menu(resume)/Power Off, so
-    // there was no direct way back to the badge screen short of detouring through Token Mode ->
-    // Badge Mode. Reuse the existing VaultOp::BadgeMode opcode (already resets mode -> Idle and
-    // redraws) so pausing gives a one-click way out.
     menu_items.push(MenuItem {
         name: String::from("Exit to Badge"),
         action_conn: Some(vault_conn),

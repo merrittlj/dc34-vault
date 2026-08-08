@@ -1440,14 +1440,8 @@ impl VaultUi {
                     }
                 }
             },
-            // ux.rs, in redraw()'s match on mode_at_entry
             VaultMode::Tetris => {
-                // Intentionally blank: Tetris owns its own render loop in main.rs via
-                // tetris_game.draw(&gfx) and never calls VaultUi::redraw(). This arm
-                // only exists to satisfy exhaustiveness — if it fires, something
-                // outside the intended Tetris code path is calling vault_ui.redraw()
-                // while in this mode, which is worth investigating rather than papering
-                // over.
+                // satisfy exhaustiveness, tetris has its own rendering loop
             } // _ => unimplemented!(),
         }
         self.gfx.flush().ok();
@@ -1616,7 +1610,7 @@ impl VaultUi {
                                 0,
                             ),
                         )
-                            .ok();
+                        .ok();
                         self.refresh_draw_list();
                     }
                     _ => {
@@ -1655,7 +1649,7 @@ impl VaultUi {
                                 0,
                             ),
                         )
-                            .ok();
+                        .ok();
                         self.refresh_draw_list();
                     }
                     _ => {
@@ -1674,7 +1668,7 @@ impl VaultUi {
                         let encoded = base45::encode(&data);
                         let code =
                             QrCode::with_error_correction_level(encoded.as_bytes(), qrcode::EcLevel::M)
-                            .expect("couldn't build QR code");
+                                .expect("couldn't build QR code");
                         log::info!(
                             "Nonce encoded {} bytes to Qrcode version {:?}",
                             encoded.as_bytes().len(),
