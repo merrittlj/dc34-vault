@@ -326,11 +326,6 @@ fn main() -> ! {
     let mut k_last = '\u{0000}';
     let mut skip_one_key = false;
     let mut tetris_game: Option<tetris::TetrisGame> = None;
-    // Set by key handlers instead of drawing inline, so a slow full-board redraw never runs
-    // synchronously inside the KeyPress message handler (which would stall whatever's
-    // delivering key events for the duration of the draw). TetrisTick, which already fires
-    // every 10ms, picks this up and does the actual draw - see VaultOp::TetrisTick below.
-    let mut tetris_dirty = false;
     let mut last_rotate = Instant::now() - Duration::from_secs(1);
     const ROTATE_DEBOUNCE_MS: u64 = 50;
     let mut last_drop = Instant::now() - Duration::from_secs(1);
@@ -441,18 +436,18 @@ fn main() -> ! {
                         match k {
                             '←' => {
                                 game.move_left();
-                                tetris_dirty = true;
+                                game.draw(&gfx);
                             }
                             '→' => {
                                 game.move_right();
-                                tetris_dirty = true;
+                                game.draw(&gfx);
                             }
                             '↓' => {
                                 let now = Instant::now();
                                 if now.duration_since(last_drop) >= Duration::from_millis(DROP_DEBOUNCE_MS) {
                                     last_drop = now;
                                     game.hard_drop();
-                                    tetris_dirty = true;
+                                    game.draw(&gfx);
                                 }
                             }
                             '🔥' => {
@@ -460,7 +455,7 @@ fn main() -> ! {
                                 if now.duration_since(last_rotate) >= Duration::from_millis(ROTATE_DEBOUNCE_MS) {
                                     last_rotate = now;
                                     game.rotate();
-                                    tetris_dirty = true;
+                                    game.draw(&gfx);
                                 }
                             }
                             '∴' => {
@@ -1113,10 +1108,8 @@ fn main() -> ! {
             Some(VaultOp::TetrisTick) => {
                 if !menu_active {
                     if let Some(game) = tetris_game.as_mut() {
-                        let gravity_advanced = game.gravity_tick();
-                        if gravity_advanced || tetris_dirty {
+                        if game.gravity_tick() {
                             game.draw(&gfx);
-                            tetris_dirty = false;
                         }
                         if game.is_over() {
                             // return to main list screen
