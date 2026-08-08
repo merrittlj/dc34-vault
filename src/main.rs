@@ -458,6 +458,12 @@ fn main() -> ! {
                                     game.draw(&gfx);
                                 }
                             }
+                            '↑' => {
+                                if game.started {
+                                    game.toggle_idle_mode();
+                                    game.draw(&gfx);
+                                }
+                            }
                             '∴' => {
                                 // pause: fall through to idle menu like the normal flow does
                                 animate.store(false, Ordering::SeqCst);
@@ -1101,23 +1107,34 @@ fn main() -> ! {
             },
             Some(VaultOp::MenuTetris) => {
                 *mode.lock().unwrap() = VaultMode::Tetris;
-                let game = tetris::TetrisGame::new(&gfx);
+                let mut game = tetris::TetrisGame::new(&gfx);
+                game.started = true;
                 game.draw(&gfx);
                 tetris_game = Some(game);
             }
             Some(VaultOp::TetrisTick) => {
                 if !menu_active {
                     if let Some(game) = tetris_game.as_mut() {
-                        if game.gravity_tick() {
+                        let idle_moved = game.idle_tick();
+                        let gravity_advanced = game.gravity_tick();
+                        if idle_moved || gravity_advanced {
                             game.draw(&gfx);
                         }
                         if game.is_over() {
-                            // return to main list screen
-                            tetris_game = None;
-                            *mode.lock().unwrap() = VaultMode::Idle;
-                            animate.store(false, Ordering::SeqCst);
-                            idle_menu_mgr.redraw();
-                            menu_active = true;
+                            if game.is_idle_mode() {
+                                // keep the demo running instead of kicking out to the menu
+                                let mut fresh_game = tetris::TetrisGame::new(&gfx);
+                                fresh_game.toggle_idle_mode();
+                                fresh_game.draw(&gfx);
+                                tetris_game = Some(fresh_game);
+                            } else {
+                                // return to main list screen
+                                tetris_game = None;
+                                *mode.lock().unwrap() = VaultMode::Idle;
+                                animate.store(false, Ordering::SeqCst);
+                                idle_menu_mgr.redraw();
+                                menu_active = true;
+                            }
                         }
                     }
                 }

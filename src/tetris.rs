@@ -28,6 +28,10 @@ const GRAVITY_TICKS: u32 = 60;
 const CLEAR_ANIM_TICKS_PER_FRAME: u8 = 8;
 const CLEAR_ANIM_FRAMES: u8 = 4;
 
+// how often idle_tick() takes a solver step while idle mode is on, in raw ticks
+// (30 * 10ms = 300ms - half the speed of the original 15-tick/150ms pace)
+const IDLE_MOVE_TICKS: u32 = 30;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Piece {
     O,
@@ -42,10 +46,6 @@ enum Piece {
 const ALL_PIECES: [Piece; 7] =
     [Piece::O, Piece::I, Piece::S, Piece::Z, Piece::T, Piece::L, Piece::J];
 
-/// Tracks an in-progress row-clear flash: which board rows are involved, and how many ticks
-/// have elapsed. While this is `Some`, gravity and player input are both paused - there's no
-/// active falling piece during the flash, matching the brief freeze most Tetris games do on a
-/// clear.
 struct ClearAnim {
     rows: Vec<usize>,
     frame: u8,
@@ -70,6 +70,13 @@ pub struct TetrisGame {
     // raw ticks elapsed since the last gravity step
     gravity_accum: u32,
     game_over: bool,
+    // set once MenuTetris has spun up the game; gates the '↑' key from toggling idle mode
+    // before the game is actually up and running
+    pub(crate) started: bool,
+    // true while the "playing itself" idle animation is active - see idle_tick
+    idle_mode: bool,
+    // raw ticks since the last idle move
+    idle_accum: u32,
     cell_px: isize,
     origin_x: isize,
     origin_y: isize,
@@ -114,6 +121,9 @@ impl TetrisGame {
             clearing: None,
             gravity_accum: 0,
             game_over: false,
+            started: false,
+            idle_mode: false,
+            idle_accum: 0,
             cell_px,
             origin_x,
             origin_y,
@@ -206,6 +216,155 @@ impl TetrisGame {
         self.collides_shape(px, py, self.cells())
     }
 
+    // toggles idle animation mode - see the `idle_mode` field
+    pub fn toggle_idle_mode(&mut self) {
+        self.idle_mode = !self.idle_mode;
+        self.idle_accum = 0;
+    }
+
+    pub fn is_idle_mode(&self) -> bool {
+        self.idle_mode
+    }
+
+    // called once per raw tick like gravity_tick - while idle_mode is on, every
+    // IDLE_MOVE_TICKS ticks this takes one step (rotate/slide/drop) toward the current best
+    // placement, as picked by the heuristic solver below. Returns whether anything changed,
+    // so the caller knows to redraw.
+    pub fn idle_tick(&mut self) -> bool {
+        if !self.idle_mode || self.game_over || self.clearing.is_some() {
+            return false;
+        }
+        self.idle_accum += 1;
+        if self.idle_accum < IDLE_MOVE_TICKS {
+            return false;
+        }
+        self.idle_accum = 0;
+
+        let before = (self.px, self.py, self.rotation);
+        self.bot_tick();
+        (self.px, self.py, self.rotation) != before
+    }
+
+    // heuristic solver: picks a placement for the current piece and walks toward it
+    // simulates dropping a piece (given as 4 (dx,dy) cells)
+    fn simulate_drop(
+        board: &[[bool; BOARD_W]],
+        board_h: usize,
+        px: i32,
+        cells: [(i32, i32); 4],
+    ) -> Option<Vec<[bool; BOARD_W]>> {
+        let collides = |px: i32, py: i32| -> bool {
+            for (dx, dy) in cells {
+                let (x, y) = (px + dx, py + dy);
+                if x < 0 || x >= BOARD_W as i32 || y >= board_h as i32 {
+                    return true;
+                }
+                if y >= 0 && board[y as usize][x as usize] {
+                    return true;
+                }
+            }
+            false
+        };
+        if collides(px, 0) {
+            return None;
+        }
+        let mut py = 0;
+        let mut iterations = 0;
+        while !collides(px, py + 1) {
+            py += 1;
+            iterations += 1;
+            if iterations > 1000 {  // board should never be this tall
+                panic!("simulate_drop infinite loop: px={}, cells={:?}", px, cells);
+            }
+        }
+        let mut new_board = board.to_vec();
+        for (dx, dy) in cells {
+            let (x, y) = (px + dx, py + dy);
+            if y >= 0 {
+                new_board[y as usize][x as usize] = true;
+            }
+        }
+        Some(new_board)
+    }
+
+    // classic 4-term heuristic: higher is better, standard published starting weights
+    fn score_board(board: &[[bool; BOARD_W]], board_h: usize) -> f32 {
+        let mut heights = [0i32; BOARD_W];
+        for col in 0..BOARD_W {
+            heights[col] =
+                (0..board_h).find(|&r| board[r][col]).map_or(0, |r| (board_h - r) as i32);
+        }
+        let agg_height: i32 = heights.iter().sum();
+        let bumpiness: i32 = heights.windows(2).map(|w| (w[0] - w[1]).abs()).sum();
+
+        let mut holes = 0;
+        for col in 0..BOARD_W {
+            let mut seen_block = false;
+            for row in 0..board_h {
+                if board[row][col] {
+                    seen_block = true;
+                } else if seen_block {
+                    holes += 1;
+                }
+            }
+        }
+        let lines_cleared = (0..board_h).filter(|&r| board[r].iter().all(|&c| c)).count() as i32;
+
+        -0.51 * agg_height as f32 - 0.36 * holes as f32 - 0.18 * bumpiness as f32
+            + 0.76 * lines_cleared as f32
+    }
+
+    // tries every (rotation, column) placement for the current piece, returns the
+    // best-scoring one
+    fn best_placement(&self) -> Option<(u8, i32)> {
+        let mut best: Option<(u8, i32, f32)> = None;
+        let rotations: &[u8] = if self.piece == Piece::O { &[0] } else { &[0, 1, 2, 3] };
+        for &rotation in rotations {
+            let cells = Self::cells_for(self.piece, rotation);
+            for col in -3..(BOARD_W as i32 + 3) {
+                if let Some(board) = Self::simulate_drop(&self.board, self.board_h, col, cells) {
+                    let score = Self::score_board(&board, self.board_h);
+                    if best.map_or(true, |(_, _, s)| score > s) {
+                        best = Some((rotation, col, score));
+                    }
+                }
+            }
+        }
+        best.map(|(r, c, _)| (r, c))
+    }
+
+    // one step (rotate first, then slide, then hard-drop once aligned) toward the current
+    // best placement, recomputes the target every call
+    fn bot_tick(&mut self) {
+        let (target_rotation, target_col) = match self.best_placement() {
+            Some(t) => t,
+            None => return, // shouldn't happen - spawn already checked for game_over
+        };
+        if self.rotation != target_rotation {
+            let rotation_before = self.rotation;
+            self.rotate();
+            if self.rotation != rotation_before {
+                return;
+            }
+            // rotate() failed at this column (e.g. wall-kick range exhausted near an edge) -
+            // slide toward the target column instead of retrying the same rotation forever,
+            // then rotation will be re-attempted from a more favorable column next tick
+            if self.px < target_col {
+                self.move_right();
+            } else if self.px > target_col {
+                self.move_left();
+            }
+            // if we're already at target_col and rotation still won't succeed, best_placement
+            // will simply be re-evaluated fresh next tick against whatever the board allows
+        } else if self.px < target_col {
+            self.move_right();
+        } else if self.px > target_col {
+            self.move_left();
+        } else {
+            self.hard_drop();
+        }
+    }
+
     // attempt simple wall-kick
     pub fn rotate(&mut self) {
         if self.game_over || self.clearing.is_some() || self.piece == Piece::O {
@@ -213,7 +372,9 @@ impl TetrisGame {
         }
         let new_rotation = (self.rotation + 1) % 4;
         let new_cells = Self::cells_for(self.piece, new_rotation);
-        for kick in [0, -1, 1, -2, 2] {
+        // widened from [0, -1, 1, -2, 2] - the 4-wide I-piece bounding box can need a 3-cell
+        // kick near the walls, and the narrower table let it get stuck failing to rotate there
+        for kick in [0, -1, 1, -2, 2, -3, 3] {
             if !self.collides_shape(self.px + kick, self.py, new_cells) {
                 self.px += kick;
                 self.rotation = new_rotation;
